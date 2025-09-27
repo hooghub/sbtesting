@@ -1,14 +1,14 @@
 #!/bin/bash
-# sing-box 无域名自签证书部署 (VLESS TCP TLS + Hysteria2 TLS)
+# sing-box 自签证书部署 (VLESS TLS + HY2 TLS)
 # Author: ChatGPT
 set -euo pipefail
 
-echo "=== Sing-box 无域名自签证书部署 (VLESS TLS + Hysteria2 TLS) ==="
+echo "=== Sing-box 自签证书部署 (VLESS TLS + HY2 TLS) ==="
 
-# 检查 root
+# 1️⃣ 检查 root
 [[ $EUID -ne 0 ]] && echo "请用 root 权限运行" && exit 1
 
-# 检测公网 IPv4
+# 2️⃣ 获取公网 IP
 PUBLIC_IP=$(curl -s --max-time 8 https://ipv4.icanhazip.com || curl -s --max-time 8 https://ifconfig.me)
 if [[ -z "$PUBLIC_IP" ]]; then
   read -rp "无法自动检测公网 IP，请手动输入: " PUBLIC_IP
@@ -16,16 +16,16 @@ fi
 PUBLIC_IP=$(echo "$PUBLIC_IP" | tr -d '[:space:]')
 echo "公网 IP: $PUBLIC_IP"
 
-# 安装依赖
+# 3️⃣ 安装依赖
 apt update -y
 apt install -y curl openssl qrencode socat dnsutils jq
 
-# 安装 sing-box
+# 4️⃣ 安装 sing-box
 if ! command -v sing-box &>/dev/null; then
     bash <(curl -fsSL https://sing-box.app/deb-install.sh)
 fi
 
-# 随机端口函数
+# 5️⃣ 随机端口函数
 get_random_port() {
   while :; do
     PORT=$((RANDOM%50000+10000))
@@ -33,7 +33,7 @@ get_random_port() {
   done
 }
 
-# 输入端口
+# 6️⃣ 输入端口
 read -rp "请输入 VLESS TCP 端口 (默认 443, 0随机): " VLESS_PORT
 VLESS_PORT=${VLESS_PORT:-443}
 [[ "$VLESS_PORT" == "0" || -z "$VLESS_PORT" ]] && VLESS_PORT=$(get_random_port)
@@ -42,7 +42,7 @@ read -rp "请输入 HY2 UDP 端口 (默认 8443, 0随机): " HY2_PORT
 HY2_PORT=${HY2_PORT:-8443}
 [[ "$HY2_PORT" == "0" || -z "$HY2_PORT" ]] && HY2_PORT=$(get_random_port)
 
-# 生成 UUID 和 HY2 密码
+# 7️⃣ 生成 UUID 和 HY2 密码
 UUID=$(cat /proc/sys/kernel/random/uuid)
 HY2_PASS=$(openssl rand -base64 12 | tr -d '/+=' | cut -c1-16)
 
@@ -51,11 +51,11 @@ echo "HY2 PASS: $HY2_PASS"
 echo "VLESS port: $VLESS_PORT"
 echo "HY2 port: $HY2_PORT"
 
-# 证书目录
+# 8️⃣ 证书目录
 CERT_DIR="/etc/ssl/singbox_self"
 mkdir -p "$CERT_DIR"
 
-# 生成自签证书 (IP SAN)
+# 9️⃣ 生成自签证书 (IP SAN)
 echo ">>> 生成自签证书..."
 openssl req -x509 -nodes -days 3650 \
     -newkey rsa:2048 \
@@ -66,11 +66,11 @@ openssl req -x509 -nodes -days 3650 \
 
 chmod 600 "$CERT_DIR"/*.pem
 
-# 创建配置目录
+# 10️⃣ 创建配置目录
 CONFIG_DIR="/etc/sing-box/config"
 mkdir -p "$CONFIG_DIR"
 
-# 生成配置文件
+# 11️⃣ 生成配置文件
 cat > "$CONFIG_DIR/config.json" <<EOF
 {
   "log": { "level": "info" },
@@ -110,22 +110,22 @@ cat > "$CONFIG_DIR/config.json" <<EOF
 }
 EOF
 
-# 确认 systemd 服务指向目录
+# 12️⃣ 确认 systemd 服务指向目录
 if grep -q "ExecStart=/usr/bin/sing-box" /lib/systemd/system/sing-box.service; then
     sed -i "s#ExecStart=.*#ExecStart=/usr/bin/sing-box run -C $CONFIG_DIR#g" /lib/systemd/system/sing-box.service
 fi
 
-# 重载 systemd 并启动
+# 13️⃣ 重载 systemd 并启动
 systemctl daemon-reload
 systemctl enable sing-box
 systemctl restart sing-box
 sleep 2
 
-# 检查端口监听
+# 14️⃣ 检查端口监听
 [[ -n "$(ss -tulnp | grep $VLESS_PORT)" ]] && echo "[✔] VLESS TCP $VLESS_PORT 正在监听" || echo "[✖] VLESS TCP $VLESS_PORT 未监听"
 [[ -n "$(ss -u -l -n | grep $HY2_PORT)" ]] && echo "[✔] HY2 UDP $HY2_PORT 正在监听" || echo "[✖] HY2 UDP $HY2_PORT 未监听"
 
-# 输出节点 URI
+# 15️⃣ 输出节点 URI
 VLESS_URI="vless://$UUID@$PUBLIC_IP:$VLESS_PORT?encryption=none&security=tls&sni=$PUBLIC_IP&type=tcp#VLESS-$PUBLIC_IP"
 HY2_URI="hysteria2://$HY2_PASS@$PUBLIC_IP:$HY2_PORT?insecure=1#HY2-$PUBLIC_IP"
 
@@ -138,7 +138,7 @@ echo "HY2 URI:"
 echo "$HY2_URI"
 echo "$HY2_URI" | qrencode -t ansiutf8 || true
 
-# 生成订阅 JSON
+# 16️⃣ 生成订阅 JSON
 SUB_FILE="/root/singbox_nodes_self_signed.json"
 cat > "$SUB_FILE" <<EOF
 {

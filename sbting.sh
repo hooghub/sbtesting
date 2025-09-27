@@ -1,5 +1,5 @@
 #!/bin/bash
-# sing-box 无域名自签证书部署 (VLESS TCP TLS + HY2 UDP TLS)
+# sing-box 无域名自签证书部署 (VLESS TCP TLS + Hysteria2 TLS)
 # Author: ChatGPT
 set -euo pipefail
 
@@ -18,14 +18,14 @@ echo "公网 IP: $PUBLIC_IP"
 
 # 安装依赖
 apt update -y
-apt install -y curl openssl qrencode jq socat dnsutils
+apt install -y curl openssl qrencode socat dnsutils jq
 
 # 安装 sing-box
 if ! command -v sing-box &>/dev/null; then
     bash <(curl -fsSL https://sing-box.app/deb-install.sh)
 fi
 
-# 随机端口生成函数
+# 随机端口函数
 get_random_port() {
   while :; do
     PORT=$((RANDOM%50000+10000))
@@ -51,10 +51,11 @@ echo "HY2 PASS: $HY2_PASS"
 echo "VLESS port: $VLESS_PORT"
 echo "HY2 port: $HY2_PORT"
 
-# 自签证书目录
+# 证书目录
 CERT_DIR="/etc/ssl/singbox_self"
 mkdir -p "$CERT_DIR"
 
+# 生成自签证书 (IP SAN)
 echo ">>> 生成自签证书..."
 openssl req -x509 -nodes -days 3650 \
     -newkey rsa:2048 \
@@ -65,9 +66,12 @@ openssl req -x509 -nodes -days 3650 \
 
 chmod 600 "$CERT_DIR"/*.pem
 
-# 生成 sing-box 配置
-mkdir -p /etc/sing-box
-cat > /etc/sing-box/config.json <<EOF
+# 创建配置目录
+CONFIG_DIR="/etc/sing-box/config"
+mkdir -p "$CONFIG_DIR"
+
+# 生成配置文件
+cat > "$CONFIG_DIR/config.json" <<EOF
 {
   "log": { "level": "info" },
   "inbounds": [
@@ -106,7 +110,13 @@ cat > /etc/sing-box/config.json <<EOF
 }
 EOF
 
-# 启动 sing-box 并开机自启
+# 确认 systemd 服务指向目录
+if grep -q "ExecStart=/usr/bin/sing-box" /lib/systemd/system/sing-box.service; then
+    sed -i "s#ExecStart=.*#ExecStart=/usr/bin/sing-box run -C $CONFIG_DIR#g" /lib/systemd/system/sing-box.service
+fi
+
+# 重载 systemd 并启动
+systemctl daemon-reload
 systemctl enable sing-box
 systemctl restart sing-box
 sleep 2
@@ -115,7 +125,7 @@ sleep 2
 [[ -n "$(ss -tulnp | grep $VLESS_PORT)" ]] && echo "[✔] VLESS TCP $VLESS_PORT 正在监听" || echo "[✖] VLESS TCP $VLESS_PORT 未监听"
 [[ -n "$(ss -u -l -n | grep $HY2_PORT)" ]] && echo "[✔] HY2 UDP $HY2_PORT 正在监听" || echo "[✖] HY2 UDP $HY2_PORT 未监听"
 
-# 输出节点 URI（客户端需要允许不安全 TLS）
+# 输出节点 URI
 VLESS_URI="vless://$UUID@$PUBLIC_IP:$VLESS_PORT?encryption=none&security=tls&sni=$PUBLIC_IP&type=tcp#VLESS-$PUBLIC_IP"
 HY2_URI="hysteria2://$HY2_PASS@$PUBLIC_IP:$HY2_PORT?insecure=1#HY2-$PUBLIC_IP"
 
@@ -135,10 +145,10 @@ cat > "$SUB_FILE" <<EOF
   "ip": "$PUBLIC_IP",
   "vless": "$VLESS_URI",
   "hysteria2": "$HY2_URI",
-  "singbox_config": "/etc/sing-box/config.json",
+  "singbox_config_dir": "$CONFIG_DIR",
   "certificate": "$CERT_DIR/fullchain.pem"
 }
 EOF
 
 echo "订阅文件已保存到: $SUB_FILE"
-echo "部署完成。客户端使用时请允许自签证书或导入 fullchain.pem"
+echo "部署完成，客户端使用时请允许自签证书或导入 fullchain.pem"

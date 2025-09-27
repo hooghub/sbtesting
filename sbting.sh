@@ -1,76 +1,64 @@
 #!/bin/bash
-# sing-box 自签证书部署 (VLESS TLS + HY2 TLS UDP+QUIC)
+# Sing-box 完整部署脚本 (自签证书 + VLESS TLS + HY2 UDP+QUIC)
 # Author: ChatGPT
-set -euo pipefail
 
-echo "=== Sing-box 自签证书部署 (VLESS TLS + HY2 TLS UDP+QUIC) ==="
+set -e
 
-# 1️⃣ 检查 root
+echo "=================== Sing-box 自签证书部署 ==================="
+
+# 检查 root
 [[ $EUID -ne 0 ]] && echo "请用 root 权限运行" && exit 1
 
-# 2️⃣ 获取公网 IP
-PUBLIC_IP=$(curl -s --max-time 8 https://ipv4.icanhazip.com || curl -s --max-time 8 https://ifconfig.me)
-if [[ -z "$PUBLIC_IP" ]]; then
-  read -rp "无法自动检测公网 IP，请手动输入: " PUBLIC_IP
-fi
-PUBLIC_IP=$(echo "$PUBLIC_IP" | tr -d '[:space:]')
-echo "公网 IP: $PUBLIC_IP"
-
-# 3️⃣ 安装依赖
+# 安装依赖
 apt update -y
-apt install -y curl openssl qrencode socat dnsutils jq
+apt install -y curl socat openssl qrencode dnsutils
 
-# 4️⃣ 安装 sing-box
+# 安装 sing-box
 if ! command -v sing-box &>/dev/null; then
     bash <(curl -fsSL https://sing-box.app/deb-install.sh)
 fi
 
-# 5️⃣ 随机端口函数
+# 获取公网 IP
+PUBLIC_IP=$(curl -s ipv4.icanhazip.com || curl -s ifconfig.me)
+echo "[✔] 公网 IP: $PUBLIC_IP"
+
+# 随机端口函数
 get_random_port() {
-  while :; do
-    PORT=$((RANDOM%50000+10000))
-    ss -nulp | awk '{print $5}' | grep -q ":$PORT$" && continue || { echo "$PORT"; break; }
-  done
+    while :; do
+        PORT=$((RANDOM%50000+10000))
+        ss -tuln | grep -q $PORT || break
+    done
+    echo $PORT
 }
 
-# 6️⃣ 输入端口
+# 输入端口
 read -rp "请输入 VLESS TCP 端口 (默认 443, 0随机): " VLESS_PORT
-VLESS_PORT=${VLESS_PORT:-443}
 [[ "$VLESS_PORT" == "0" || -z "$VLESS_PORT" ]] && VLESS_PORT=$(get_random_port)
 
 read -rp "请输入 HY2 UDP/QUIC 端口 (默认 8443, 0随机): " HY2_PORT
-HY2_PORT=${HY2_PORT:-8443}
 [[ "$HY2_PORT" == "0" || -z "$HY2_PORT" ]] && HY2_PORT=$(get_random_port)
 
-# 7️⃣ 生成 UUID 和 HY2 密码
+# UUID / HY2 密码
 UUID=$(cat /proc/sys/kernel/random/uuid)
-HY2_PASS=$(openssl rand -base64 12 | tr -d '/+=' | cut -c1-16)
+HY2_PASS=$(openssl rand -base64 12)
 
-echo "UUID: $UUID"
-echo "HY2 PASS: $HY2_PASS"
-echo "VLESS port: $VLESS_PORT"
-echo "HY2 port: $HY2_PORT"
-
-# 8️⃣ 证书目录
+# 配置目录
+CONFIG_DIR="/etc/sing-box/config"
 CERT_DIR="/etc/ssl/singbox_self"
-mkdir -p "$CERT_DIR"
+mkdir -p "$CONFIG_DIR" "$CERT_DIR"
 
-# 9️⃣ 生成自签证书 (IP SAN)
-echo ">>> 生成自签证书..."
+# 生成自签证书（IP SAN）
 openssl req -x509 -nodes -days 3650 \
     -newkey rsa:2048 \
     -keyout "$CERT_DIR/privkey.pem" \
     -out "$CERT_DIR/fullchain.pem" \
     -subj "/CN=$PUBLIC_IP" \
-    -addext "subjectAltName=IP:$PUBLIC_IP"
+    -addext "subjectAltName=IP:$PUBLIC_IP" \
+    -batch -quiet
 
 chmod 600 "$CERT_DIR"/*.pem
 
-# 10️⃣ 创建配置目录
-CONFIG_DIR="/etc/sing-box/config"
-mkdir -p "$CONFIG_DIR"
-
-# 11️⃣ 生成配置文件
+# sing-box 配置
 cat > "$CONFIG_DIR/config.json" <<EOF
 {
   "log": { "level": "info" },
@@ -79,10 +67,11 @@ cat > "$CONFIG_DIR/config.json" <<EOF
       "type": "vless",
       "listen": "0.0.0.0",
       "listen_port": $VLESS_PORT,
-      "users": [{ "uuid": "$UUID" }],
+      "users": [{"uuid": "$UUID"}],
       "decryption": "none",
       "tls": {
         "enabled": true,
+        "server_name": "$PUBLIC_IP",
         "certificate_path": "$CERT_DIR/fullchain.pem",
         "key_path": "$CERT_DIR/privkey.pem"
       }
@@ -91,59 +80,58 @@ cat > "$CONFIG_DIR/config.json" <<EOF
       "type": "hysteria2",
       "listen": "0.0.0.0",
       "listen_port": $HY2_PORT,
-      "users": [{ "password": "$HY2_PASS" }],
+      "users": [{"password": "$HY2_PASS"}],
       "tls": {
         "enabled": true,
+        "server_name": "$PUBLIC_IP",
         "certificate_path": "$CERT_DIR/fullchain.pem",
         "key_path": "$CERT_DIR/privkey.pem"
       },
-      "udp": { "enabled": true },
-      "quic": { "enabled": true, "max_streams": 1024 }
+      "up_mbps": 1000,
+      "down_mbps": 1000,
+      "quic": {
+        "enabled": true
+      }
     }
   ],
-  "outbounds": [{ "type": "direct" }]
+  "outbounds": [{"type": "direct"}]
 }
 EOF
 
-# 12️⃣ systemd 指向目录
-if grep -q "ExecStart=/usr/bin/sing-box" /lib/systemd/system/sing-box.service; then
-    sed -i "s#ExecStart=.*#ExecStart=/usr/bin/sing-box run -C $CONFIG_DIR#g" /lib/systemd/system/sing-box.service
-fi
+# 权限
+chown -R sing-box:sing-box "$CONFIG_DIR" "$CERT_DIR"
 
-# 13️⃣ 重载 systemd 并启动
+# 重载 systemd 并启动
 systemctl daemon-reload
-systemctl enable sing-box
-systemctl restart sing-box
-sleep 2
+systemctl enable --now sing-box
+sleep 3
 
-# 14️⃣ 检查端口监听
-[[ -n "$(ss -tulnp | grep $VLESS_PORT)" ]] && echo "[✔] VLESS TCP $VLESS_PORT 正在监听" || echo "[✖] VLESS TCP $VLESS_PORT 未监听"
-[[ -n "$(ss -u -l -n | grep $HY2_PORT)" ]] && echo "[✔] HY2 UDP/QUIC $HY2_PORT 正在监听" || echo "[✖] HY2 UDP/QUIC $HY2_PORT 未监听"
+# 检查端口
+[[ -n "$(ss -tulnp | grep $VLESS_PORT)" ]] && echo "[✔] VLESS TCP $VLESS_PORT 已监听" || echo "[✖] VLESS TCP $VLESS_PORT 未监听"
+[[ -n "$(ss -ulnp | grep $HY2_PORT)" ]] && echo "[✔] HY2 UDP/QUIC $HY2_PORT 已监听" || echo "[✖] HY2 UDP/QUIC $HY2_PORT 未监听"
 
-# 15️⃣ 输出节点 URI
+# 输出节点 URI
 VLESS_URI="vless://$UUID@$PUBLIC_IP:$VLESS_PORT?encryption=none&security=tls&sni=$PUBLIC_IP&type=tcp#VLESS-$PUBLIC_IP"
-HY2_URI="hysteria2://$HY2_PASS@$PUBLIC_IP:$HY2_PORT?insecure=1&quic=1#HY2-$PUBLIC_IP"
+HY2_URI="hysteria2://$HY2_PASS@$PUBLIC_IP:$HY2_PORT?insecure=0&sni=$PUBLIC_IP#HY2-$PUBLIC_IP"
 
-echo -e "\n=================== 节点信息 ==================="
-echo "VLESS URI:"
+echo -e "\n=================== VLESS 节点 ==================="
 echo "$VLESS_URI"
-echo "$VLESS_URI" | qrencode -t ansiutf8 || true
-echo
-echo "HY2 URI:"
-echo "$HY2_URI"
-echo "$HY2_URI" | qrencode -t ansiutf8 || true
+echo "二维码："
+echo "$VLESS_URI" | qrencode -t ansiutf8
 
-# 16️⃣ 生成订阅 JSON
+echo -e "\n=================== HY2 节点 ==================="
+echo "$HY2_URI"
+echo "二维码："
+echo "$HY2_URI" | qrencode -t ansiutf8
+
+# 生成订阅文件
 SUB_FILE="/root/singbox_nodes_self_signed_quic.json"
-cat > "$SUB_FILE" <<EOF
+cat > $SUB_FILE <<EOF
 {
-  "ip": "$PUBLIC_IP",
   "vless": "$VLESS_URI",
-  "hysteria2": "$HY2_URI",
-  "singbox_config_dir": "$CONFIG_DIR",
-  "certificate": "$CERT_DIR/fullchain.pem"
+  "hysteria2": "$HY2_URI"
 }
 EOF
+echo -e "\n订阅文件已生成: $SUB_FILE"
 
-echo "订阅文件已保存到: $SUB_FILE"
-echo "部署完成，客户端请允许自签证书或导入 fullchain.pem，HY2 已开启 QUIC + UDP"
+echo -e "\n=================== 部署完成 ==================="

@@ -1,23 +1,44 @@
 #!/bin/bash
-# Sing-box 全自动静默部署脚本
-# 支持: VLESS TCP+TLS, HY2 UDP+QUIC+TLS, 自签 IP SAN, 随机端口, systemd
-# Author: ChatGPT
+# ==============================================
+# Sing-box 改进版静默安装脚本
+# 自动部署 VLESS TCP + TLS, HY2 UDP + QUIC + TLS
+# 支持自签 TLS (IP SAN)
+# 自动生成 QR / 节点 URI / 订阅 JSON
+# ==============================================
 
 set -euo pipefail
 
 CONFIG_DIR="/etc/sing-box/config"
 mkdir -p "$CONFIG_DIR"
 
-# -------- 随机端口函数 --------
-rand_port() {
-    shuf -i 20000-65000 -n 1
-}
+# -------- 安装必要依赖 --------
+if ! command -v sing-box &>/dev/null; then
+    echo "安装 sing-box..."
+    curl -Ls https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-amd64.zip -o /tmp/sing-box.zip
+    unzip -q /tmp/sing-box.zip -d /usr/local/bin/
+    chmod +x /usr/local/bin/sing-box
+fi
 
-# -------- 获取服务器公网 IP --------
-IP=$(curl -s https://api.ip.sb/ip)
-[[ -z "$IP" ]] && IP="127.0.0.1"
+for dep in curl qrencode jq openssl; do
+    if ! command -v $dep &>/dev/null; then
+        apt update -y
+        DEBIAN_FRONTEND=noninteractive apt install -y $dep
+    fi
+done
 
-# -------- 生成自签证书 (IP SAN) --------
+# -------- 获取 VPS 公网 IP --------
+IP=$(curl -s https://api.ip.sb/ip || echo "127.0.0.1")
+
+# -------- 随机端口 --------
+rand_port() { shuf -i 20000-65000 -n 1; }
+TCP_PORT=$(rand_port)
+UDP_PORT=$(rand_port)
+QUIC_PORT=$(rand_port)
+
+# -------- 生成 UUID --------
+UUID=$(cat /proc/sys/kernel/random/uuid)
+
+# -------- 自签 TLS 证书 --------
 CERT="$CONFIG_DIR/server.crt"
 KEY="$CONFIG_DIR/server.key"
 if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
@@ -27,13 +48,6 @@ if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
         -addext "subjectAltName = IP:$IP" \
         -quiet >/dev/null 2>&1
 fi
-
-# -------- 随机端口 --------
-TCP_PORT=$(rand_port)
-UDP_PORT=$(rand_port)
-QUIC_PORT=$(rand_port)
-
-UUID=$(cat /proc/sys/kernel/random/uuid)
 
 # -------- 生成 sing-box 配置 --------
 CONFIG_JSON="$CONFIG_DIR/config.json"
@@ -45,17 +59,12 @@ cat > "$CONFIG_JSON" <<EOF
       "tag": "vless-tcp",
       "listen": "0.0.0.0",
       "port": $TCP_PORT,
-      "sniff": true,
       "tls": {
         "enabled": true,
         "certificate": "$CERT",
         "key": "$KEY"
       },
-      "users": [
-        {
-          "name": "$UUID"
-        }
-      ]
+      "users": [{"name": "$UUID"}]
     },
     {
       "type": "hy2",
@@ -65,27 +74,16 @@ cat > "$CONFIG_JSON" <<EOF
       "quic": {
         "enabled": true,
         "port": $QUIC_PORT,
-        "tls": {
-          "certificate": "$CERT",
-          "key": "$KEY"
-        }
+        "tls": {"certificate": "$CERT","key": "$KEY"}
       },
-      "users": [
-        {
-          "name": "$UUID"
-        }
-      ]
+      "users": [{"name": "$UUID"}]
     }
   ],
-  "outbounds": [
-    {
-      "type": "direct"
-    }
-  ]
+  "outbounds":[{"type":"direct"}]
 }
 EOF
 
-# -------- 创建 systemd 服务 --------
+# -------- systemd 服务 --------
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -106,7 +104,7 @@ EOF
 systemctl daemon-reload
 systemctl enable --now sing-box
 
-# -------- 生成 VLESS URI --------
+# -------- 节点 URI --------
 VLESS_URI="vless://$UUID@$IP:$TCP_PORT?encryption=none&security=tls&type=tcp#SingBox-TCP"
 HY2_URI="hy2://$UUID@$IP:$UDP_PORT?security=tls&type=quic&quicPort=$QUIC_PORT#SingBox-HY2"
 
@@ -119,16 +117,15 @@ cat > "$SUB_JSON" <<EOF
 ]
 EOF
 
-# -------- 安装 qrencode 并生成 QR --------
-if ! command -v qrencode &>/dev/null; then
-    apt update -y && apt install -y qrencode
-fi
-
+# -------- 生成 QR --------
 qrencode -t ansiutf8 "$VLESS_URI"
 qrencode -t ansiutf8 "$HY2_URI"
 
+echo "=============================="
 echo "部署完成！"
 echo "VLESS TCP URI: $VLESS_URI"
 echo "HY2 UDP+QUIC URI: $HY2_URI"
-echo "订阅文件: $SUB_JSON"
+echo "订阅 JSON: $SUB_JSON"
 echo "配置目录: $CONFIG_DIR"
+echo "systemd 服务: sing-box"
+echo "=============================="

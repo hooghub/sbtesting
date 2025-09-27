@@ -1,131 +1,138 @@
 #!/bin/bash
-# ======================================================
-# Sing-box VPS 一键安装脚本（优化版）
-# 自动安装依赖/下载 sing-box
-# 自动检测 VPS 公网 IP + 手动输入 IP
-# 支持自签 TLS + VLESS TCP + HY2 UDP+QUIC
-# 自动生成节点 URI、QR 和订阅 JSON
-# ======================================================
 
-set -euo pipefail
+set -e
 
-CONFIG_DIR="/etc/sing-box/config"
-mkdir -p "$CONFIG_DIR"
+# 颜色
+GREEN='\033[0;32m'
+NC='\033[0m'
 
-# ---------------- 安装必要依赖 ----------------
-install_dep() {
-    local dep=$1
-    if ! command -v "$dep" &>/dev/null; then
-        echo "[INFO] 安装依赖: $dep"
-        apt update -y >/dev/null 2>&1
-        DEBIAN_FRONTEND=noninteractive apt install -y "$dep" >/dev/null 2>&1
-    fi
-}
+echo -e "${GREEN}Sing-box 一键部署脚本启动...${NC}"
 
-for dep in curl unzip openssl qrencode jq; do
-    install_dep $dep
-done
-
-# ---------------- 下载 Sing-box ----------------
-if ! command -v sing-box &>/dev/null; then
-    echo "[INFO] 下载 sing-box 可执行文件"
-    TMP_ZIP="/tmp/sing-box.zip"
-    curl -Ls https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-amd64.zip -o "$TMP_ZIP"
-    unzip -q "$TMP_ZIP" -d /usr/local/bin/
-    chmod +x /usr/local/bin/sing-box
+# 检查 root 权限
+if [ "$EUID" -ne 0 ]; then
+  echo "请以 root 权限运行此脚本!"
+  exit 1
 fi
 
-# ---------------- 自动检测 VPS 公网 IP ----------------
-detect_ip() {
-    local ip
-    for url in "https://ifconfig.me/ip" "https://api64.ipify.org" "https://ipinfo.io/ip" "https://ident.me"; do
-        ip=$(curl -s "$url" || true)
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "$ip"
-            return
-        fi
-    done
-    echo ""
-}
+# 安装依赖
+echo -e "${GREEN}检查并安装依赖...${NC}"
+apt update
+apt install -y curl wget unzip qrencode socat openssl
 
-read -p "请输入 VPS 公网 IP（回车自动检测）: " IP_INPUT
-if [[ -n "$IP_INPUT" ]]; then
-    IP="$IP_INPUT"
-else
-    IP=$(detect_ip)
-    if [[ -z "$IP" ]]; then
-        echo "[WARN] 自动检测失败，请手动输入 VPS 公网 IP"
-        read -p "请输入 VPS 公网 IP: " IP
-    fi
-fi
-echo "[INFO] 使用公网 IP: $IP"
+# 变量
+INSTALL_DIR="/usr/local/bin"
+CONFIG_DIR="/etc/sing-box"
+CERT_DIR="$CONFIG_DIR/cert"
+SERVICE_FILE="/etc/systemd/system/sing-box.service"
 
-# ---------------- 随机端口生成 ----------------
-rand_port() { shuf -i 20000-65000 -n 1; }
-TCP_PORT=$(rand_port)
-UDP_PORT=$(rand_port)
-QUIC_PORT=$(rand_port)
+[ ! -d "$CONFIG_DIR" ] && mkdir -p "$CONFIG_DIR"
+[ ! -d "$CERT_DIR" ] && mkdir -p "$CERT_DIR"
+
+# 获取最新 sing-box 版本
+echo -e "${GREEN}获取最新版 sing-box...${NC}"
+ARCH=$(uname -m)
+case $ARCH in
+    x86_64) ARCH="amd64" ;;
+    aarch64) ARCH="arm64" ;;
+    armv7l) ARCH="armv7" ;;
+    *) echo "不支持的架构: $ARCH"; exit 1 ;;
+esac
+
+VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d '"' -f4)
+URL="https://github.com/SagerNet/sing-box/releases/download/${VER}/sing-box-${VER#v}-linux-${ARCH}.zip"
+
+cd /tmp
+wget -O sing-box.zip "$URL"
+unzip -o sing-box.zip
+install -m 755 sing-box/sing-box "$INSTALL_DIR/sing-box"
+rm -rf sing-box sing-box.zip
+
+# 端口（随机或自定义）
+read -p "请输入 VLESS TCP+TLS 端口（回车随机）： " VLESS_PORT
+read -p "请输入 HY2 UDP+QUIC+TLS 端口（回车随机）： " HY2_PORT
+
+VLESS_PORT=${VLESS_PORT:-$((RANDOM%55535+10000))}
+HY2_PORT=${HY2_PORT:-$((RANDOM%55535+10000))}
+
+# 生成 UUID
 UUID=$(cat /proc/sys/kernel/random/uuid)
 
-# ---------------- 自签 TLS 证书 ----------------
-CERT="$CONFIG_DIR/server.crt"
-KEY="$CONFIG_DIR/server.key"
-if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
-    echo "[INFO] 生成自签 TLS 证书"
-    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout "$KEY" -out "$CERT" \
-        -subj "/CN=$IP" \
-        -addext "subjectAltName = IP:$IP" \
-        -quiet >/dev/null 2>&1
-fi
+# 获取 IP（支持 IPv6）
+IP=$(curl -6s https://api64.ipify.org || curl -4s https://api.ipify.org)
 
-# ---------------- 生成 sing-box 配置 ----------------
-CONFIG_JSON="$CONFIG_DIR/config.json"
-cat > "$CONFIG_JSON" <<EOF
+# 生成自签证书（支持IP SAN）
+echo -e "${GREEN}生成自签证书（3年有效，支持 IP SAN）...${NC}"
+openssl req -new -newkey rsa:2048 -days 1095 -nodes -x509 \
+    -subj "/CN=$IP" \
+    -addext "subjectAltName = IP:$IP" \
+    -keyout "$CERT_DIR/key.pem" \
+    -out "$CERT_DIR/cert.pem"
+
+# 写入配置
+cat > $CONFIG_DIR/config.json <<EOF
 {
+  "log": {
+    "level": "info"
+  },
   "inbounds": [
     {
       "type": "vless",
-      "tag": "vless-tcp",
-      "listen": "0.0.0.0",
-      "port": $TCP_PORT,
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": $VLESS_PORT,
+      "users": [
+        {
+          "uuid": "$UUID",
+          "flow": ""
+        }
+      ],
       "tls": {
         "enabled": true,
-        "certificate": "$CERT",
-        "key": "$KEY"
-      },
-      "users": [{"name": "$UUID"}]
+        "server_name": "$IP",
+        "certificate_path": "$CERT_DIR/cert.pem",
+        "key_path": "$CERT_DIR/key.pem"
+      }
     },
     {
       "type": "hy2",
-      "tag": "hy2-udp",
-      "listen": "0.0.0.0",
-      "port": $UDP_PORT,
-      "quic": {
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": $HY2_PORT,
+      "users": [
+        {
+          "uuid": "$UUID"
+        }
+      ],
+      "tls": {
         "enabled": true,
-        "port": $QUIC_PORT,
-        "tls": {"certificate": "$CERT","key": "$KEY"}
+        "server_name": "$IP",
+        "certificate_path": "$CERT_DIR/cert.pem",
+        "key_path": "$CERT_DIR/key.pem"
       },
-      "users": [{"name": "$UUID"}]
+      "quic": {
+        "enabled": true
+      }
     }
   ],
-  "outbounds":[{"type":"direct"}]
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
 }
 EOF
 
-# ---------------- systemd 服务 ----------------
-SERVICE_FILE="/etc/systemd/system/sing-box.service"
-cat > "$SERVICE_FILE" <<EOF
+# 写入 systemd 服务
+cat > $SERVICE_FILE <<EOF
 [Unit]
 Description=Sing-box Service
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/sing-box run -c $CONFIG_JSON
+ExecStart=$INSTALL_DIR/sing-box run -c $CONFIG_DIR/config.json
 Restart=on-failure
-RestartSec=3s
-LimitNOFILE=65535
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
@@ -134,28 +141,43 @@ EOF
 systemctl daemon-reload
 systemctl enable --now sing-box
 
-# ---------------- 节点 URI ----------------
-VLESS_URI="vless://$UUID@$IP:$TCP_PORT?encryption=none&security=tls&type=tcp#SingBox-TCP"
-HY2_URI="hy2://$UUID@$IP:$UDP_PORT?security=tls&type=quic&quicPort=$QUIC_PORT#SingBox-HY2"
+sleep 2
 
-# ---------------- 生成订阅 JSON ----------------
-SUB_JSON="$CONFIG_DIR/subscribe.json"
-cat > "$SUB_JSON" <<EOF
+# 生成节点 URI 和二维码
+VLESS_URI="vless://$UUID@$IP:$VLESS_PORT?encryption=none&security=tls&type=tcp&sni=$IP#singbox-vless"
+HY2_URI="hy2://$UUID@$IP:$HY2_PORT?security=tls&sni=$IP#singbox-hy2"
+
+echo -e "${GREEN}VLESS 节点信息:${NC}"
+echo "$VLESS_URI"
+qrencode -o - "$VLESS_URI" 2>/dev/null | cat
+
+echo -e "${GREEN}HY2 节点信息:${NC}"
+echo "$HY2_URI"
+qrencode -o - "$HY2_URI" 2>/dev/null | cat
+
+# 生成订阅 JSON
+cat > $CONFIG_DIR/subscribe.json <<EOF
 [
-  {"name":"SingBox-TCP","type":"vless","server":"$IP","port":$TCP_PORT,"uuid":"$UUID","tls":true},
-  {"name":"SingBox-HY2","type":"hy2","server":"$IP","port":$UDP_PORT,"uuid":"$UUID","tls":true,"quicPort":$QUIC_PORT}
+  {
+    "name": "singbox-vless",
+    "type": "vless",
+    "server": "$IP",
+    "port": $VLESS_PORT,
+    "uuid": "$UUID",
+    "tls": true
+  },
+  {
+    "name": "singbox-hy2",
+    "type": "hy2",
+    "server": "$IP",
+    "port": $HY2_PORT,
+    "uuid": "$UUID",
+    "tls": true
+  }
 ]
 EOF
 
-# ---------------- 生成 QR ----------------
-qrencode -t ansiutf8 "$VLESS_URI"
-qrencode -t ansiutf8 "$HY2_URI"
+echo -e "${GREEN}订阅 JSON 路径: $CONFIG_DIR/subscribe.json${NC}"
 
-echo "======================================"
-echo "部署完成！"
-echo "VLESS TCP URI: $VLESS_URI"
-echo "HY2 UDP+QUIC URI: $HY2_URI"
-echo "订阅 JSON: $SUB_JSON"
-echo "配置目录: $CONFIG_DIR"
-echo "systemd 服务: sing-box"
-echo "======================================"
+echo -e "${GREEN}Sing-box 已部署完成，systemd 服务已启动。${NC}"
+systemctl status sing-box --no-pager

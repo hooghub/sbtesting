@@ -28,7 +28,7 @@ SERVICE_FILE="/etc/systemd/system/sing-box.service"
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$CERT_DIR"
 
-# ======================== 下载最新版 Sing-box ========================
+# ======================== 自动下载最新版 Sing-box ========================
 echo -e "${GREEN}获取最新版 Sing-box...${NC}"
 ARCH=$(uname -m)
 case $ARCH in
@@ -38,11 +38,19 @@ case $ARCH in
     *) echo "不支持的架构: $ARCH"; exit 1 ;;
 esac
 
-VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d '"' -f4)
-URL="https://github.com/SagerNet/sing-box/releases/download/${VER}/sing-box-${VER#v}-linux-${ARCH}.zip"
+# 获取最新 release 并自动匹配对应架构的 zip 文件
+ASSET_URL=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+  | grep browser_download_url \
+  | grep "linux-$ARCH.zip" \
+  | cut -d '"' -f4)
+
+if [ -z "$ASSET_URL" ]; then
+    echo "未找到适合 $ARCH 的 Sing-box 下载链接"
+    exit 1
+fi
 
 cd /tmp
-wget -O sing-box.zip "$URL"
+wget -O sing-box.zip "$ASSET_URL"
 unzip -o sing-box.zip
 install -m 755 sing-box/sing-box "$INSTALL_DIR/sing-box"
 rm -rf sing-box sing-box.zip

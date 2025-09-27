@@ -1,47 +1,55 @@
 #!/bin/bash
-# ==============================================
-# Sing-box 改进版静默安装脚本
-# 自动部署 VLESS TCP + TLS, HY2 UDP + QUIC + TLS
-# 支持自签 TLS (IP SAN)
-# 自动生成 QR / 节点 URI / 订阅 JSON
-# ==============================================
+# ======================================================
+# Sing-box VPS 一键安装脚本（优化版）
+# 自动安装依赖/下载 sing-box，可直接运行
+# 支持自签 TLS + VLESS TCP + HY2 UDP+QUIC
+# 自动生成节点 URI、QR 和订阅 JSON
+# ======================================================
 
 set -euo pipefail
 
 CONFIG_DIR="/etc/sing-box/config"
 mkdir -p "$CONFIG_DIR"
 
-# -------- 安装必要依赖 --------
+# ---------------- 安装必要依赖 ----------------
+install_dep() {
+    local dep=$1
+    if ! command -v "$dep" &>/dev/null; then
+        echo "[INFO] 安装依赖: $dep"
+        apt update -y >/dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive apt install -y "$dep" >/dev/null 2>&1
+    fi
+}
+
+for dep in curl unzip openssl qrencode jq; do
+    install_dep $dep
+done
+
+# ---------------- 下载 Sing-box ----------------
 if ! command -v sing-box &>/dev/null; then
-    echo "安装 sing-box..."
-    curl -Ls https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-amd64.zip -o /tmp/sing-box.zip
-    unzip -q /tmp/sing-box.zip -d /usr/local/bin/
+    echo "[INFO] 下载 sing-box 可执行文件"
+    TMP_ZIP="/tmp/sing-box.zip"
+    curl -Ls https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-amd64.zip -o "$TMP_ZIP"
+    unzip -q "$TMP_ZIP" -d /usr/local/bin/
     chmod +x /usr/local/bin/sing-box
 fi
 
-for dep in curl qrencode jq openssl; do
-    if ! command -v $dep &>/dev/null; then
-        apt update -y
-        DEBIAN_FRONTEND=noninteractive apt install -y $dep
-    fi
-done
-
-# -------- 获取 VPS 公网 IP --------
+# ---------------- 获取 VPS 公网 IP ----------------
 IP=$(curl -s https://api.ip.sb/ip || echo "127.0.0.1")
+echo "[INFO] 检测到 VPS 公网 IP: $IP"
 
-# -------- 随机端口 --------
+# ---------------- 随机端口生成 ----------------
 rand_port() { shuf -i 20000-65000 -n 1; }
 TCP_PORT=$(rand_port)
 UDP_PORT=$(rand_port)
 QUIC_PORT=$(rand_port)
-
-# -------- 生成 UUID --------
 UUID=$(cat /proc/sys/kernel/random/uuid)
 
-# -------- 自签 TLS 证书 --------
+# ---------------- 自签 TLS 证书 ----------------
 CERT="$CONFIG_DIR/server.crt"
 KEY="$CONFIG_DIR/server.key"
 if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
+    echo "[INFO] 生成自签 TLS 证书"
     openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
         -keyout "$KEY" -out "$CERT" \
         -subj "/CN=$IP" \
@@ -49,7 +57,7 @@ if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
         -quiet >/dev/null 2>&1
 fi
 
-# -------- 生成 sing-box 配置 --------
+# ---------------- 生成 sing-box 配置 ----------------
 CONFIG_JSON="$CONFIG_DIR/config.json"
 cat > "$CONFIG_JSON" <<EOF
 {
@@ -83,7 +91,7 @@ cat > "$CONFIG_JSON" <<EOF
 }
 EOF
 
-# -------- systemd 服务 --------
+# ---------------- systemd 服务 ----------------
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -104,11 +112,11 @@ EOF
 systemctl daemon-reload
 systemctl enable --now sing-box
 
-# -------- 节点 URI --------
+# ---------------- 节点 URI ----------------
 VLESS_URI="vless://$UUID@$IP:$TCP_PORT?encryption=none&security=tls&type=tcp#SingBox-TCP"
 HY2_URI="hy2://$UUID@$IP:$UDP_PORT?security=tls&type=quic&quicPort=$QUIC_PORT#SingBox-HY2"
 
-# -------- 生成订阅 JSON --------
+# ---------------- 生成订阅 JSON ----------------
 SUB_JSON="$CONFIG_DIR/subscribe.json"
 cat > "$SUB_JSON" <<EOF
 [
@@ -117,15 +125,15 @@ cat > "$SUB_JSON" <<EOF
 ]
 EOF
 
-# -------- 生成 QR --------
+# ---------------- 生成 QR ----------------
 qrencode -t ansiutf8 "$VLESS_URI"
 qrencode -t ansiutf8 "$HY2_URI"
 
-echo "=============================="
+echo "======================================"
 echo "部署完成！"
 echo "VLESS TCP URI: $VLESS_URI"
 echo "HY2 UDP+QUIC URI: $HY2_URI"
 echo "订阅 JSON: $SUB_JSON"
 echo "配置目录: $CONFIG_DIR"
 echo "systemd 服务: sing-box"
-echo "=============================="
+echo "======================================"

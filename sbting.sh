@@ -1,9 +1,9 @@
 #!/bin/bash
-# sing-box 自签证书部署 (VLESS TLS + HY2 TLS)
+# sing-box 自签证书部署 (VLESS TLS + HY2 TLS UDP+QUIC)
 # Author: ChatGPT
 set -euo pipefail
 
-echo "=== Sing-box 自签证书部署 (VLESS TLS + HY2 TLS) ==="
+echo "=== Sing-box 自签证书部署 (VLESS TLS + HY2 TLS UDP+QUIC) ==="
 
 # 1️⃣ 检查 root
 [[ $EUID -ne 0 ]] && echo "请用 root 权限运行" && exit 1
@@ -38,7 +38,7 @@ read -rp "请输入 VLESS TCP 端口 (默认 443, 0随机): " VLESS_PORT
 VLESS_PORT=${VLESS_PORT:-443}
 [[ "$VLESS_PORT" == "0" || -z "$VLESS_PORT" ]] && VLESS_PORT=$(get_random_port)
 
-read -rp "请输入 HY2 UDP 端口 (默认 8443, 0随机): " HY2_PORT
+read -rp "请输入 HY2 UDP/QUIC 端口 (默认 8443, 0随机): " HY2_PORT
 HY2_PORT=${HY2_PORT:-8443}
 [[ "$HY2_PORT" == "0" || -z "$HY2_PORT" ]] && HY2_PORT=$(get_random_port)
 
@@ -79,9 +79,7 @@ cat > "$CONFIG_DIR/config.json" <<EOF
       "type": "vless",
       "listen": "0.0.0.0",
       "listen_port": $VLESS_PORT,
-      "users": [
-        { "uuid": "$UUID" }
-      ],
+      "users": [{ "uuid": "$UUID" }],
       "decryption": "none",
       "tls": {
         "enabled": true,
@@ -93,24 +91,21 @@ cat > "$CONFIG_DIR/config.json" <<EOF
       "type": "hysteria2",
       "listen": "0.0.0.0",
       "listen_port": $HY2_PORT,
-      "users": [
-        { "password": "$HY2_PASS" }
-      ],
+      "users": [{ "password": "$HY2_PASS" }],
       "tls": {
         "enabled": true,
         "certificate_path": "$CERT_DIR/fullchain.pem",
         "key_path": "$CERT_DIR/privkey.pem"
       },
-      "udp": { "enabled": true }
+      "udp": { "enabled": true },
+      "quic": { "enabled": true, "max_streams": 1024 }
     }
   ],
-  "outbounds": [
-    { "type": "direct" }
-  ]
+  "outbounds": [{ "type": "direct" }]
 }
 EOF
 
-# 12️⃣ 确认 systemd 服务指向目录
+# 12️⃣ systemd 指向目录
 if grep -q "ExecStart=/usr/bin/sing-box" /lib/systemd/system/sing-box.service; then
     sed -i "s#ExecStart=.*#ExecStart=/usr/bin/sing-box run -C $CONFIG_DIR#g" /lib/systemd/system/sing-box.service
 fi
@@ -123,11 +118,11 @@ sleep 2
 
 # 14️⃣ 检查端口监听
 [[ -n "$(ss -tulnp | grep $VLESS_PORT)" ]] && echo "[✔] VLESS TCP $VLESS_PORT 正在监听" || echo "[✖] VLESS TCP $VLESS_PORT 未监听"
-[[ -n "$(ss -u -l -n | grep $HY2_PORT)" ]] && echo "[✔] HY2 UDP $HY2_PORT 正在监听" || echo "[✖] HY2 UDP $HY2_PORT 未监听"
+[[ -n "$(ss -u -l -n | grep $HY2_PORT)" ]] && echo "[✔] HY2 UDP/QUIC $HY2_PORT 正在监听" || echo "[✖] HY2 UDP/QUIC $HY2_PORT 未监听"
 
 # 15️⃣ 输出节点 URI
 VLESS_URI="vless://$UUID@$PUBLIC_IP:$VLESS_PORT?encryption=none&security=tls&sni=$PUBLIC_IP&type=tcp#VLESS-$PUBLIC_IP"
-HY2_URI="hysteria2://$HY2_PASS@$PUBLIC_IP:$HY2_PORT?insecure=1#HY2-$PUBLIC_IP"
+HY2_URI="hysteria2://$HY2_PASS@$PUBLIC_IP:$HY2_PORT?insecure=1&quic=1#HY2-$PUBLIC_IP"
 
 echo -e "\n=================== 节点信息 ==================="
 echo "VLESS URI:"
@@ -139,7 +134,7 @@ echo "$HY2_URI"
 echo "$HY2_URI" | qrencode -t ansiutf8 || true
 
 # 16️⃣ 生成订阅 JSON
-SUB_FILE="/root/singbox_nodes_self_signed.json"
+SUB_FILE="/root/singbox_nodes_self_signed_quic.json"
 cat > "$SUB_FILE" <<EOF
 {
   "ip": "$PUBLIC_IP",
@@ -151,4 +146,4 @@ cat > "$SUB_FILE" <<EOF
 EOF
 
 echo "订阅文件已保存到: $SUB_FILE"
-echo "部署完成，客户端使用时请允许自签证书或导入 fullchain.pem"
+echo "部署完成，客户端请允许自签证书或导入 fullchain.pem，HY2 已开启 QUIC + UDP"

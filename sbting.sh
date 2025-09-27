@@ -22,7 +22,7 @@ apt install -y curl wget unzip socat openssl qrencode jq
 
 # ----------------- 获取公网 IP -----------------
 PUBLIC_IP=$(curl -s4 icanhazip.com)
-echo "[INFO] 检测到 VPS 公网 IP: $PUBLIC_IP"
+echo "[INFO] 使用 VPS 公网 IP: $PUBLIC_IP"
 
 # ----------------- 用户输入端口 -----------------
 read -rp "请输入自定义 VLESS TCP 端口(默认 $DEFAULT_VLESS_PORT): " VLESS_PORT

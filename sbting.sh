@@ -2,6 +2,7 @@
 # ======================================================
 # Sing-box VPS 一键安装脚本（优化版）
 # 自动安装依赖/下载 sing-box，可直接运行
+# 自动检测 VPS 公网 IP，多接口兜底
 # 支持自签 TLS + VLESS TCP + HY2 UDP+QUIC
 # 自动生成节点 URI、QR 和订阅 JSON
 # ======================================================
@@ -34,8 +35,20 @@ if ! command -v sing-box &>/dev/null; then
     chmod +x /usr/local/bin/sing-box
 fi
 
-# ---------------- 获取 VPS 公网 IP ----------------
-IP=$(curl -s https://api.ip.sb/ip || echo "127.0.0.1")
+# ---------------- 自动检测 VPS 公网 IP ----------------
+detect_ip() {
+    local ip
+    for url in "https://ifconfig.me" "https://api64.ipify.org" "https://ip.sb/ip"; do
+        ip=$(curl -s "$url" || true)
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return
+        fi
+    done
+    echo "127.0.0.1"
+}
+
+IP=$(detect_ip)
 echo "[INFO] 检测到 VPS 公网 IP: $IP"
 
 # ---------------- 随机端口生成 ----------------

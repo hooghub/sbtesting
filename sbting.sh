@@ -46,9 +46,10 @@ else
     echo "不支持的架构: $ARCH" && exit 1
 fi
 
-SINGBOX_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name')
-wget -O /tmp/sing-box.zip "https://github.com/SagerNet/sing-box/releases/download/$SINGBOX_VER/sing-box-$SINGBOX_VER-linux-$ARCH_TAG.zip"
-unzip -o /tmp/sing-box.zip -d /usr/local/bin/
+# 固定最新版下载链接（官方 tar.gz）
+SINGBOX_VER="v1.12.8"
+wget -O /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/$SINGBOX_VER/sing-box-$SINGBOX_VER-linux-$ARCH_TAG.tar.gz"
+tar -xzf /tmp/sing-box.tar.gz -C /usr/local/bin/
 chmod +x /usr/local/bin/sing-box
 
 # ----------------- 创建目录 -----------------

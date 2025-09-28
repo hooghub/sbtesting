@@ -1,9 +1,4 @@
 #!/bin/sh
-# Alpine Sing-box OpenRC 一键安装脚本
-# 完全兼容 Alpine 3.18+
-# 只使用 dcron，去掉 cronie
-# Author: optimized by ChatGPT
-
 set -e
 
 SINGBOX_DIR="/etc/singbox"
@@ -17,14 +12,10 @@ mkdir -p "$SINGBOX_DIR" "$CERT_DIR"
 
 # Root check
 [ "$(id -u)" != "0" ] && echo "请用 root 运行" && exit 1
-
 echo "[✔] Root 权限 OK"
 
 # Detect OS
-if ! grep -qi "alpine" /etc/os-release; then
-    echo "[✖] 本脚本仅支持 Alpine Linux"
-    exit 1
-fi
+grep -qi "alpine" /etc/os-release || { echo "[✖] 本脚本仅支持 Alpine"; exit 1; }
 echo "[✔] 检测到系统: Alpine Linux"
 
 # Detect Public IP
@@ -35,44 +26,25 @@ echo "[✔] 检测到公网 IP: $PUBLIC_IP"
 echo "[*] 安装依赖..."
 apk update
 apk add --no-cache dcron curl wget bash openssl iproute2
-
-# Remove cronie if exists
 apk del cronie 2>/dev/null || true
 
 # Generate or load port/UUID/HY2
-if [ ! -f "$PORT_FILE" ]; then
-    PORT=$((RANDOM%55535+10000))
-    echo "$PORT" > "$PORT_FILE"
-else
-    PORT=$(cat "$PORT_FILE")
-fi
+[ -f "$PORT_FILE" ] || echo $((RANDOM%55535+10000)) > "$PORT_FILE"
+PORT=$(cat "$PORT_FILE")
 
-if [ ! -f "$UUID_FILE" ]; then
-    UUID=$(cat /proc/sys/kernel/random/uuid)
-    echo "$UUID" > "$UUID_FILE"
-else
-    UUID=$(cat "$UUID_FILE")
-fi
+[ -f "$UUID_FILE" ] || cat /proc/sys/kernel/random/uuid > "$UUID_FILE"
+UUID=$(cat "$UUID_FILE")
 
-if [ ! -f "$HY2_FILE" ]; then
-    HY2_PASS=$(head -c 16 /dev/urandom | base64)
-    echo "$HY2_PASS" > "$HY2_FILE"
-else
-    HY2_PASS=$(cat "$HY2_FILE")
-fi
+[ -f "$HY2_FILE" ] || head -c 16 /dev/urandom | base64 > "$HY2_FILE"
+HY2_PASS=$(cat "$HY2_FILE")
 
-# Default mode: self-signed
-if [ ! -f "$MODE_FILE" ]; then
-    MODE="self"
-    echo "$MODE" > "$MODE_FILE"
-else
-    MODE=$(cat "$MODE_FILE")
-fi
+[ -f "$MODE_FILE" ] || echo "self" > "$MODE_FILE"
+MODE=$(cat "$MODE_FILE")
 
-# Certificate generation
+# Certificate
 generate_cert(){
     if [ "$MODE" = "self" ]; then
-        echo "[*] 自签模式，生成固定域名 www.epple.com 自签证书"
+        echo "[*] 自签模式，生成自签证书"
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
             -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
             -subj "/CN=www.epple.com"
@@ -80,7 +52,6 @@ generate_cert(){
         echo "[*] 域名模式，请输入域名:"
         read -r DOMAIN
         echo "$DOMAIN" > "$CERT_DIR/domain.conf"
-        # 使用 acme.sh 申请证书
         apk add --no-cache socat
         curl https://get.acme.sh | sh
         ~/.acme.sh/acme.sh --issue --standalone -d "$DOMAIN"
@@ -90,54 +61,16 @@ generate_cert(){
     fi
 }
 
-# Generate config
+# Config
 generate_config(){
     cat > "$SINGBOX_DIR/config.json" <<EOF
 {
-    "log": {
-        "level": "info"
-    },
-    "inbounds": [
-        {
-            "type": "tcp",
-            "listen": "0.0.0.0",
-            "listen_port": $PORT,
-            "sniff": false,
-            "tag": "vless-in",
-            "tls": {
-                "enabled": true,
-                "server_name": "www.epple.com",
-                "cert_file": "$CERT_DIR/cert.pem",
-                "key_file": "$CERT_DIR/key.pem"
-            },
-            "transport": {
-                "type": "tcp"
-            },
-            "users": [
-                {
-                    "uuid": "$UUID",
-                    "flow": "xtls-rprx-vision",
-                    "level": 0
-                }
-            ]
-        },
-        {
-            "type": "udp",
-            "listen": "0.0.0.0",
-            "listen_port": $PORT,
-            "tag": "hy2-in",
-            "transport": {
-                "type": "udp",
-                "obfs": "udp",
-                "password": "$HY2_PASS"
-            }
-        }
+    "log": {"level":"info"},
+    "inbounds":[
+        {"type":"tcp","listen":"0.0.0.0","listen_port":$PORT,"tls":{"enabled":true,"server_name":"www.epple.com","cert_file":"$CERT_DIR/cert.pem","key_file":"$CERT_DIR/key.pem"},"users":[{"uuid":"$UUID","flow":"xtls-rprx-vision","level":0}]},
+        {"type":"udp","listen":"0.0.0.0","listen_port":$PORT,"transport":{"type":"udp","obfs":"udp","password":"$HY2_PASS"}}
     ],
-    "outbounds": [
-        {
-            "type": "direct"
-        }
-    ]
+    "outbounds":[{"type":"direct"}]
 }
 EOF
 }
@@ -157,7 +90,7 @@ EOF
     rc-service singbox start || rc-service singbox restart
 }
 
-# Generate URIs
+# Show URI
 show_uri(){
     echo "===================== Sing-box 节点 ====================="
     echo "VLESS URI: vless://$UUID@$PUBLIC_IP:$PORT?encryption=none&security=tls&sni=www.epple.com&type=tcp#VLESS-$PUBLIC_IP"
@@ -171,7 +104,7 @@ generate_config
 setup_service
 show_uri
 
-# Loop menu
+# Menu
 while true; do
     echo "=================== Sing-box 管理菜单 ==================="
     echo "1) 切换模式 (自签/域名)"
@@ -200,14 +133,7 @@ while true; do
             show_uri
             ;;
         3)
-            if [ "$MODE" = "domain" ]; then
-                generate_cert
-                generate_config
-                rc-service singbox restart
-                show_uri
-            else
-                echo "[✖] 自签模式无法申请域名证书"
-            fi
+            [ "$MODE" = "domain" ] && generate_cert && generate_config && rc-service singbox restart && show_uri || echo "[✖] 自签模式无法申请域名证书"
             ;;
         4)
             rc-service singbox restart

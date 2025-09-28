@@ -1,7 +1,4 @@
 #!/bin/sh
-# Alpine OpenRC Sing-box 一键部署脚本（最终修正版）
-# Author: ChatGPT + Chis
-
 set -e
 
 SINGBOX_DIR="/etc/singbox"
@@ -17,11 +14,11 @@ echo "[✔] Root 权限 OK"
 OS=$(awk -F= '/^ID=/ {print $2}' /etc/os-release)
 echo "[✔] 检测到系统: $OS"
 
-# 安装依赖
+# 安装依赖，只安装 dcron
 echo "[*] 安装依赖..."
 apk update
 apk add bash curl socat openssl wget dcron iproute2 >/dev/null 2>&1
-export PATH=$PATH:/usr/sbin:/sbin
+export PATH=$PATH:/usr/sbin:/sbin:/bin
 
 # 检测公网 IP
 SERVER_IP=$(curl -s ipv4.icanhazip.com || curl -s ifconfig.me)
@@ -39,7 +36,6 @@ if [ ! -f "$PORT_FILE" ]; then
     echo "$VLESS_PORT $HY2_PORT $UUID $HY2_PASS $MODE $DOMAIN" > "$PORT_FILE"
 fi
 
-# 读取配置
 read VLESS_PORT HY2_PORT UUID HY2_PASS MODE DOMAIN < "$PORT_FILE"
 
 # ---------------- 函数 ----------------
@@ -54,7 +50,6 @@ check_port() {
 
 generate_cert() {
     if [ "$MODE" -eq 1 ]; then
-        # 域名模式
         echo "[*] 域名模式，申请/更新 Let’s Encrypt 证书"
         [ -z "$DOMAIN" ] && { echo "[✖] 域名为空"; return 1; }
         if ! command -v acme.sh >/dev/null 2>&1; then
@@ -68,7 +63,6 @@ generate_cert() {
             --key-file "$SINGBOX_DIR/privkey.pem" \
             --fullchain-file "$SINGBOX_DIR/fullchain.pem" --force
     else
-        # 自签模式
         echo "[*] 自签模式，生成固定域名 $DOMAIN 自签证书"
         openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
             -keyout "$SINGBOX_DIR/privkey.pem" \

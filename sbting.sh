@@ -1,163 +1,241 @@
 #!/bin/sh
-# Alpine Sing-box 一键部署脚本（兼容无 qrencode）
-# Author: Chis (优化 by ChatGPT)
-# shellcheck disable=SC3043
+# Alpine 专用 Sing-box 一键部署脚本
+# 作者: Chis (优化)
 
 set -e
 
-CONFIG_FILE="/etc/sing-box/config.json"
-CERT_DIR="/etc/ssl/sing-box"
-DATA_FILE="/etc/sing-box/sb_data.env"
+CONFIG_DIR="/etc/sing-box"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+CERT_DIR="$CONFIG_DIR/cert"
+DATA_FILE="$CONFIG_DIR/data.conf"
 
-mkdir -p "$CERT_DIR"
-mkdir -p /etc/sing-box
+# 创建必要目录
+mkdir -p "$CONFIG_DIR" "$CERT_DIR"
 
-# ---------------- 检查 root ----------------
+# --------- 检查 root ---------
 [ "$(id -u)" != "0" ] && echo "[✖] 请用 root 权限运行" && exit 1
 
-# ---------------- 检测系统 ----------------
-OS=$(awk -F= '/^ID=/{print $2}' /etc/os-release)
-echo "[✔] 检测系统: $OS"
-
-# ---------------- 安装依赖 ----------------
-apk update
-apk add --no-cache curl openssl socat bash coreutils bind-tools iproute2
-
-# dcron 默认即可
-if ! command -v crond >/dev/null 2>&1; then
-    apk add --no-cache dcron
+# --------- 检测系统 ---------
+OS_NAME=$(awk -F= '/^ID=/{print $2}' /etc/os-release | tr -d '"')
+if [ "$OS_NAME" = "alpine" ]; then
+    PKG_MGR="apk"
+else
+    echo "[✖] 仅支持 Alpine Linux" && exit 1
 fi
 
-# ---------------- 检测公网 IP ----------------
-SERVER_IP=$(curl -s ipv4.icanhazip.com || curl -s ifconfig.me)
-[ -n "$SERVER_IP" ] && echo "[✔] 检测到公网 IP: $SERVER_IP" || { echo "[✖] 获取公网 IP 失败"; exit 1; }
+# --------- 安装依赖 ---------
+REQUIRED_CMDS="curl openssl socat bash bind-tools"
+for cmd in $REQUIRED_CMDS; do
+    if ! command -v $cmd >/dev/null 2>&1; then
+        echo "[!] 安装缺失依赖: $cmd"
+        apk add --no-cache $cmd
+    fi
+done
 
-# ---------------- 读取已有端口/UUID/HY2密码 ----------------
+# --------- 检测公网 IP ---------
+SERVER_IP=$(curl -s ipv4.icanhazip.com || curl -s ifconfig.me)
+[ -z "$SERVER_IP" ] && echo "[✖] 获取公网 IP 失败" && exit 1
+echo "[✔] 检测到公网 IP: $SERVER_IP"
+
+# --------- 生成随机端口函数 ---------
+get_random_port() {
+    while :; do
+        PORT=$((RANDOM%50000+10000))
+        ss -tuln | grep -q $PORT || break
+    done
+    echo $PORT
+}
+
+# --------- 读取或生成 UUID/HY2密码/端口 ---------
 if [ -f "$DATA_FILE" ]; then
     . "$DATA_FILE"
+else
+    VLESS_PORT=$(get_random_port)
+    HY2_PORT=$(get_random_port)
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+    HY2_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9')
+    MODE="2"
+    echo "VLESS_PORT=$VLESS_PORT" > "$DATA_FILE"
+    echo "HY2_PORT=$HY2_PORT" >> "$DATA_FILE"
+    echo "UUID=$UUID" >> "$DATA_FILE"
+    echo "HY2_PASS=$HY2_PASS" >> "$DATA_FILE"
+    echo "MODE=$MODE" >> "$DATA_FILE"
 fi
 
-# ---------------- 安装 sing-box ----------------
+# --------- 安装 sing-box ---------
 if ! command -v sing-box >/dev/null 2>&1; then
-    echo "[*] 安装 sing-box ..."
-    cd /tmp
-    SB_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/$SB_VER/sing-box-$SB_VER-linux-amd64.tar.gz"
-    tar xf sing-box.tar.gz -C /usr/local/bin --strip-components=1
+    echo ">>> 下载并安装 Sing-box ..."
+    curl -L -o /tmp/sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-amd64.tar.gz
+    tar -xzf /tmp/sing-box.tar.gz -C /usr/local/bin
     chmod +x /usr/local/bin/sing-box
 fi
 
-# ---------------- 菜单 ----------------
+# --------- 生成自签证书函数 ---------
+generate_self_cert() {
+    DOMAIN="www.epple.com"
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout "$CERT_DIR/privkey.pem" \
+        -out "$CERT_DIR/fullchain.pem" \
+        -subj "/CN=$DOMAIN" \
+        -addext "subjectAltName = DNS:$DOMAIN,IP:$SERVER_IP"
+    chmod 644 "$CERT_DIR/"*.pem
+}
+
+# --------- 生成域名证书函数 ---------
+generate_letsencrypt_cert() {
+    [ -z "$DOMAIN" ] && read -rp "请输入域名: " DOMAIN
+    mkdir -p "$CERT_DIR/$DOMAIN"
+    if ! command -v acme.sh >/dev/null 2>&1; then
+        echo ">>> 安装 acme.sh ..."
+        curl https://get.acme.sh | sh
+        . ~/.bashrc || true
+    fi
+    /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+    /root/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone --keylength ec-256 --force
+    /root/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc \
+        --key-file "$CERT_DIR/privkey.pem" \
+        --fullchain-file "$CERT_DIR/fullchain.pem" --force
+}
+
+# --------- 生成配置文件 ---------
+generate_config() {
+    cat > "$CONFIG_FILE" <<EOF
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "vless",
+      "listen": "0.0.0.0",
+      "listen_port": $VLESS_PORT,
+      "users": [{ "uuid": "$UUID" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "$DOMAIN",
+        "certificate_path": "$CERT_DIR/fullchain.pem",
+        "key_path": "$CERT_DIR/privkey.pem"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "listen": "0.0.0.0",
+      "listen_port": $HY2_PORT,
+      "users": [{ "password": "$HY2_PASS" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "$DOMAIN",
+        "certificate_path": "$CERT_DIR/fullchain.pem",
+        "key_path": "$CERT_DIR/privkey.pem"
+      }
+    }
+  ],
+  "outbounds": [{ "type": "direct" }]
+}
+EOF
+}
+
+# --------- systemd 服务 ---------
+setup_service() {
+    cat > /etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=Sing-box Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sing-box -c $CONFIG_FILE
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable sing-box
+}
+
+# --------- 检查端口监听 ---------
+check_ports() {
+    ss -tuln | grep -q "$VLESS_PORT" && echo "[✔] VLESS TCP $VLESS_PORT 已监听" || echo "[✖] VLESS TCP $VLESS_PORT 未监听"
+    ss -tuln | grep -q "$HY2_PORT" && echo "[✔] Hysteria2 UDP $HY2_PORT 已监听" || echo "[✖] Hysteria2 UDP $HY2_PORT 未监听"
+}
+
+# --------- 菜单循环 ---------
 while :; do
-echo -e "\nAlpine Sing-box 一键部署 - 快捷菜单"
-echo "1) 切换模式（自签/域名）"
+echo -e "\n========= Alpine Sing-box 管理 ========="
+echo "1) 切换模式 (自签/域名)"
 echo "2) 修改端口"
-echo "3) 重新申请证书（域名模式）"
+echo "3) 重新申请证书"
 echo "4) 重启/刷新服务"
-echo "5) 显示当前节点链接"
-echo "6) 删除 Sing-box"
+echo "5) 删除 Sing-box"
+echo "6) 显示当前节点信息"
 echo "0) 退出"
 read -rp "请选择操作: " CHOICE
 
 case $CHOICE in
 1)
-    echo "选择模式：1) 域名模式 2) 自签模式"
-    read -rp "请输入选项: " MODE
     if [ "$MODE" = "1" ]; then
-        read -rp "请输入域名: " DOMAIN
-        DOMAIN_IP=$(dig +short A "$DOMAIN" | tail -n1)
-        [ "$DOMAIN_IP" != "$SERVER_IP" ] && echo "[✖] 域名解析与 VPS IP 不符" && continue
-        echo "[✔] 域名解析正常"
-
-        # 安装 acme.sh
-        if ! command -v acme.sh >/dev/null 2>&1; then
-            curl https://get.acme.sh | sh
-            source ~/.bashrc || true
-        fi
-        /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-
-        # 申请证书
-        /root/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone --keylength ec-256 --force
-        /root/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc \
-            --key-file "$CERT_DIR/privkey.pem" \
-            --fullchain-file "$CERT_DIR/fullchain.pem" --force
-    else
+        MODE="2"
+        generate_self_cert
         DOMAIN="www.epple.com"
-        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-            -keyout "$CERT_DIR/privkey.pem" \
-            -out "$CERT_DIR/fullchain.pem" \
-            -subj "/CN=$DOMAIN" \
-            -addext "subjectAltName = DNS:$DOMAIN,IP:$SERVER_IP"
-    fi
-    echo "[✔] 模式切换完成"
-    ;;
-
-2)
-    read -rp "请输入 VLESS TCP 端口 (当前: ${VLESS_PORT:-443}): " TMP
-    [ -n "$TMP" ] && VLESS_PORT=$TMP
-    read -rp "请输入 Hysteria2 UDP 端口 (当前: ${HY2_PORT:-8443}): " TMP
-    [ -n "$TMP" ] && HY2_PORT=$TMP
-    echo "[✔] 端口更新完成"
-    ;;
-
-3)
-    if [ "$DOMAIN" ] && [ "$MODE" = "1" ]; then
-        /root/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone --keylength ec-256 --force
-        /root/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc \
-            --key-file "$CERT_DIR/privkey.pem" \
-            --fullchain-file "$CERT_DIR/fullchain.pem" --force
-        echo "[✔] 证书已更新"
+        echo "MODE=$MODE" > "$DATA_FILE"
+        echo "DOMAIN=$DOMAIN" >> "$DATA_FILE"
+        echo "[✔] 切换到自签模式"
     else
-        echo "[✖] 当前非域名模式，无法申请证书"
+        MODE="1"
+        read -rp "请输入域名: " DOMAIN
+        generate_letsencrypt_cert
+        echo "MODE=$MODE" > "$DATA_FILE"
+        echo "DOMAIN=$DOMAIN" >> "$DATA_FILE"
+        echo "[✔] 切换到域名模式"
     fi
-    ;;
-
-4)
-    systemctl enable sing-box >/dev/null 2>&1 || true
+    generate_config
     systemctl restart sing-box
-    sleep 2
-    echo "[✔] 服务已刷新"
+    check_ports
     ;;
-
-5)
-    UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
-    HY2_PASS=${HY2_PASS:-$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9')}
-    NODE_HOST=${DOMAIN:-$SERVER_IP}
-    INSECURE=1
-    [ "$MODE" = "1" ] && INSECURE=0
-    VLESS_URI="vless://$UUID@$NODE_HOST:$VLESS_PORT?encryption=none&security=tls&sni=$DOMAIN&type=tcp#VLESS-$NODE_HOST"
-    HY2_URI="hysteria2://$HY2_PASS@$NODE_HOST:$HY2_PORT?insecure=$INSECURE&sni=$DOMAIN#HY2-$NODE_HOST"
-    echo -e "\nVLESS: $VLESS_URI"
-    echo -e "HY2:   $HY2_URI"
-    if command -v qrencode >/dev/null 2>&1; then
-        echo "$VLESS_URI" | qrencode -t ansiutf8
-        echo "$HY2_URI" | qrencode -t ansiutf8
+2)
+    read -rp "请输入 VLESS TCP 端口: " VLESS_PORT
+    read -rp "请输入 Hysteria2 UDP 端口: " HY2_PORT
+    echo "VLESS_PORT=$VLESS_PORT" > "$DATA_FILE"
+    echo "HY2_PORT=$HY2_PORT" >> "$DATA_FILE"
+    echo "UUID=$UUID" >> "$DATA_FILE"
+    echo "HY2_PASS=$HY2_PASS" >> "$DATA_FILE"
+    echo "MODE=$MODE" >> "$DATA_FILE"
+    generate_config
+    systemctl restart sing-box
+    check_ports
+    ;;
+3)
+    if [ "$MODE" = "1" ]; then
+        generate_letsencrypt_cert
     else
-        echo "[!] 系统无 qrencode，二维码生成已跳过"
+        generate_self_cert
     fi
+    generate_config
+    systemctl restart sing-box
+    check_ports
     ;;
-
-6)
+4)
+    systemctl restart sing-box
+    check_ports
+    ;;
+5)
     systemctl stop sing-box || true
-    rm -f /usr/local/bin/sing-box "$CONFIG_FILE" "$DATA_FILE"
-    rm -rf "$CERT_DIR"
+    systemctl disable sing-box || true
+    rm -rf "$CONFIG_DIR"
+    rm -f /etc/systemd/system/sing-box.service
+    systemctl daemon-reload
     echo "[✔] Sing-box 已删除"
     exit 0
     ;;
-
-0)
-    exit 0
+6)
+    echo "模式: $( [ "$MODE" = "1" ] && echo "域名模式 ($DOMAIN)" || echo "自签模式 ($DOMAIN)")"
+    echo "VLESS TCP端口: $VLESS_PORT"
+    echo "Hysteria2 UDP端口: $HY2_PORT"
+    echo "UUID: $UUID"
+    echo "HY2密码: $HY2_PASS"
+    echo "VLESS URI: vless://$UUID@$SERVER_IP:$VLESS_PORT?encryption=none&security=tls&sni=$DOMAIN&type=tcp"
+    echo "HY2 URI: hysteria2://$HY2_PASS@$SERVER_IP:$HY2_PORT?insecure=$( [ "$MODE" = "2" ] && echo "1" || echo "0")&sni=$DOMAIN"
     ;;
-
-*)
-    echo "[✖] 输入错误"
-    ;;
+0) exit 0 ;;
+*) echo "[✖] 无效选项" ;;
 esac
-
-# ---------------- 保存端口/UUID/HY2 ----------------
-[ -n "$VLESS_PORT" ] && echo "VLESS_PORT=$VLESS_PORT" > "$DATA_FILE"
-[ -n "$HY2_PORT" ] && echo "HY2_PORT=$HY2_PORT" >> "$DATA_FILE"
-[ -n "$UUID" ] && echo "UUID=$UUID" >> "$DATA_FILE"
-[ -n "$HY2_PASS" ] && echo "HY2_PASS=$HY2_PASS" >> "$DATA_FILE"
-
 done

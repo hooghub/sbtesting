@@ -3,11 +3,11 @@
 set -e
 
 SINGBOX_DIR="/etc/singbox"
+CERT_DIR="$SINGBOX_DIR/cert"
 PORT_FILE="$SINGBOX_DIR/port.conf"
 UUID_FILE="$SINGBOX_DIR/uuid.conf"
 HY2_FILE="$SINGBOX_DIR/hy2.conf"
 MODE_FILE="$SINGBOX_DIR/mode.conf"
-CERT_DIR="$SINGBOX_DIR/cert"
 
 mkdir -p "$SINGBOX_DIR" "$CERT_DIR"
 
@@ -17,19 +17,23 @@ echo "[✔] Root 权限 OK"
 
 # OS check
 grep -qi "alpine" /etc/os-release || { echo "[✖] 本脚本仅支持 Alpine"; exit 1; }
-echo "[✔] 检测到系统: Alpine Linux"
+echo "[✔] 系统: Alpine Linux"
 
 # Public IP
 PUBLIC_IP=$(curl -s https://api.ip.sb/ip || curl -s https://ifconfig.me)
 echo "[✔] 公网 IP: $PUBLIC_IP"
 
-# Install deps (only dcron)
+# Dependencies
 echo "[*] 安装依赖..."
 apk update
-apk add --no-cache dcron curl wget bash openssl iproute2 socat jq
-apk del cronie 2>/dev/null || true
+apk del --no-cache cronie 2>/dev/null || true
+apk add --no-cache bash curl wget socat openssl iproute2 dcron
 
-# Generate config files
+# 启动 dcron
+rc-update add dcron default
+rc-service dcron start
+
+# Init config
 [ -f "$PORT_FILE" ] || echo $((RANDOM%55535+10000)) > "$PORT_FILE"
 PORT=$(cat "$PORT_FILE")
 
@@ -45,7 +49,7 @@ MODE=$(cat "$MODE_FILE")
 # Certificate
 generate_cert(){
     if [ "$MODE" = "self" ]; then
-        echo "[*] 使用自签证书"
+        echo "[*] 自签模式：生成证书"
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
             -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
             -subj "/CN=www.epple.com"
@@ -60,7 +64,7 @@ generate_cert(){
     fi
 }
 
-# Sing-box config
+# Config
 generate_config(){
     cat > "$SINGBOX_DIR/config.json" <<EOF
 {
@@ -78,7 +82,7 @@ generate_config(){
 EOF
 }
 
-# Service
+# OpenRC service
 setup_service(){
     cat > /etc/init.d/singbox <<'EOF'
 #!/sbin/openrc-run
@@ -93,7 +97,7 @@ EOF
     rc-service singbox restart
 }
 
-# Show URI
+# URIs
 show_uri(){
     echo "===================== Sing-box 节点 ====================="
     echo "VLESS: vless://$UUID@$PUBLIC_IP:$PORT?encryption=none&security=tls&sni=www.epple.com&type=tcp#VLESS-$PUBLIC_IP"
@@ -101,10 +105,28 @@ show_uri(){
     echo "========================================================"
 }
 
+# Setup dcron jobs (依赖检查 + 证书续签)
+setup_cron(){
+    CRON_FILE="/etc/crontabs/root"
+    touch "$CRON_FILE"
+
+    # 每天凌晨检查依赖是否存在
+    grep -q "apk add --no-cache bash curl wget socat openssl iproute2 dcron" "$CRON_FILE" || \
+        echo "0 3 * * * apk add --no-cache bash curl wget socat openssl iproute2 dcron >/dev/null 2>&1" >> "$CRON_FILE"
+
+    # 每 60 天尝试续签证书 (仅域名模式)
+    grep -q "acme.sh --renew-all" "$CRON_FILE" || \
+        echo "0 4 */60 * * ~/.acme.sh/acme.sh --renew-all --force >/dev/null 2>&1" >> "$CRON_FILE"
+
+    rc-service dcron restart
+    echo "[✔] dcron 定时任务已配置"
+}
+
 # First run
 generate_cert
 generate_config
 setup_service
+setup_cron
 show_uri
 
 # Menu

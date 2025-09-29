@@ -1,5 +1,12 @@
 #!/bin/sh
 # Sing-box Alpine OpenRC 一键部署脚本 (最终优化版)
+# Features:
+# - OpenRC 自动启动 sing-box
+# - 自签 / 域名模式
+# - 端口/UUID/HY2密码保留
+# - 循环菜单操作
+# - Alpine 3.18+ 直接运行
+
 set -e
 
 CONFIG_DIR="/etc/sing-box"
@@ -10,6 +17,7 @@ UUID_FILE="$CONFIG_DIR/uuid.info"
 HY2_FILE="$CONFIG_DIR/hy2.info"
 MODE_FILE="$CONFIG_DIR/mode.info"
 DOMAIN_FILE="$CONFIG_DIR/domain.info"
+SERVICE_FILE="/etc/init.d/sing-box"
 
 mkdir -p "$CONFIG_DIR" "$CERT_DIR"
 
@@ -22,9 +30,7 @@ SERVER_IP=$(curl -s ipv4.icanhazip.com || curl -s ifconfig.me)
 
 # --------- 安装依赖 ---------
 apk update
-apk add bash curl wget socat openssl iproute2 dcron || true
-rc-update add dcron default
-/etc/init.d/dcron start || true
+apk add bash curl wget socat openssl iproute2 || true
 
 # --------- 生成/读取 UUID、HY2 密码 ---------
 [ -f "$UUID_FILE" ] || cat /proc/sys/kernel/random/uuid > "$UUID_FILE"
@@ -44,14 +50,28 @@ MODE=$(cat "$MODE_FILE")
 [ -f "$DOMAIN_FILE" ] || echo "" > "$DOMAIN_FILE"
 DOMAIN=$(cat "$DOMAIN_FILE")
 
-# --------- 检查端口是否被占用 ---------
-check_port(){
-    while ss -tuln | grep -q "$1"; do
-        echo "[!] 端口 $1 被占用，重新生成"
+# --------- 随机端口函数 ---------
+get_random_port() {
+    while :; do
         PORT=$((RANDOM%50000+10000))
-        return $PORT
+        ss -tuln | grep -q "$PORT" || break
     done
+    echo "$PORT"
 }
+
+# --------- 创建 OpenRC 服务 ---------
+if [ ! -f "$SERVICE_FILE" ]; then
+cat > "$SERVICE_FILE" <<'EOF'
+#!/sbin/openrc-run
+name="sing-box"
+description="Sing-box service"
+command=/usr/local/bin/sing-box
+command_args="run -c /etc/sing-box/config.json"
+pidfile="/var/run/sing-box.pid"
+EOF
+    chmod +x "$SERVICE_FILE"
+    rc-update add sing-box default
+fi
 
 # --------- 生成证书函数 ---------
 generate_cert(){
@@ -113,6 +133,7 @@ EOF
 # --------- 初次运行 ---------
 generate_cert
 generate_config
+/etc/init.d/sing-box restart || /etc/init.d/sing-box start
 
 # --------- 循环菜单 ---------
 while :; do
@@ -134,12 +155,12 @@ while :; do
             read M
             [ "$M" = "1" ] && MODE=1 || MODE=2
             echo "$MODE" > "$MODE_FILE"
-            # 如果端口未生成，则随机生成
-            [ "$VLESS_PORT" = "0" ] && VLESS_PORT=$((RANDOM%50000+10000))
-            [ "$HY2_PORT" = "0" ] && HY2_PORT=$((RANDOM%50000+10000))
+            [ "$VLESS_PORT" = "0" ] && VLESS_PORT=$(get_random_port)
+            [ "$HY2_PORT" = "0" ] && HY2_PORT=$(get_random_port)
             echo "$VLESS_PORT $HY2_PORT" > "$PORT_FILE"
             generate_cert
             generate_config
+            /etc/init.d/sing-box restart || /etc/init.d/sing-box start
             echo "[✔] 模式已切换为 $([ "$MODE" = "1" ] && echo 域名 || echo 自签)"
             ;;
         2)
@@ -147,23 +168,21 @@ while :; do
             read VP
             printf "请输入 Hysteria2 UDP 端口 (0 随机): "
             read HP
-            [ -z "$VP" ] || [ "$VP" = "0" ] && VP=$((RANDOM%50000+10000))
-            [ -z "$HP" ] || [ "$HP" = "0" ] && HP=$((RANDOM%50000+10000))
+            [ -z "$VP" ] || [ "$VP" = "0" ] && VP=$(get_random_port)
+            [ -z "$HP" ] || [ "$HP" = "0" ] && HP=$(get_random_port)
             VLESS_PORT=$VP
             HY2_PORT=$HP
             echo "$VLESS_PORT $HY2_PORT" > "$PORT_FILE"
             generate_config
+            /etc/init.d/sing-box restart || /etc/init.d/sing-box start
             ;;
         3)
-            [ "$MODE" = "1" ] && /root/.acme.sh/acme.sh --renew -d "$DOMAIN" --force && generate_config && echo "[✔] 证书已更新" || echo "[✖] 自签模式无需证书"
+            [ "$MODE" = "1" ] && /root/.acme.sh/acme.sh --renew -d "$DOMAIN" --force && generate_config && /etc/init.d/sing-box restart && echo "[✔] 证书已更新" || echo "[✖] 自签模式无需证书"
             ;;
         4)
-            if [ -f /etc/init.d/sing-box ]; then
-                /etc/init.d/sing-box restart || /etc/init.d/sing-box start
-            fi
+            /etc/init.d/sing-box restart || /etc/init.d/sing-box start
             ;;
         5)
-            # 检查端口是否监听
             ss -tuln | grep -q "$VLESS_PORT" || echo "[!] VLESS TCP 端口 $VLESS_PORT 未监听"
             ss -tuln | grep -q "$HY2_PORT" || echo "[!] HY2 UDP 端口 $HY2_PORT 未监听"
             NODE_HOST="$([ "$MODE" = "1" ] && echo "$DOMAIN" || echo "$SERVER_IP")"
